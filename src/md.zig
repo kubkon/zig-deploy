@@ -1,4 +1,5 @@
 const std = @import("std");
+const assert = std.debug.assert;
 const log = std.log;
 const mem = std.mem;
 
@@ -64,6 +65,10 @@ const AmDevice = extern struct {
         }
     }
 
+    fn isPaired(self: *AmDevice) bool {
+        return AMDeviceIsPaired(self) == 1;
+    }
+
     fn getName(self: *AmDevice, allocator: Allocator) ![]const u8 {
         const key = stringFromBytes("DeviceName");
         defer key.deinit();
@@ -76,28 +81,205 @@ const AmDevice = extern struct {
         return @intToEnum(IntefaceType, AMDeviceGetInterfaceType(self));
     }
 
-    fn installBundle(self: *AmDevice, bundle_id: []const u8, bundle_path: []const u8) !void {
+    fn secureTransferPath(self: *AmDevice, url: Url, opts: DictRef) !void {
+        switch (AMDeviceSecureTransferPath(0, self, url, opts, transferCallback, 0)) {
+            0 => {},
+            else => |e| {
+                log.err("secure transfer path failed with error: {d}", .{e});
+                return error.SecureTransferPathFailed;
+            },
+        }
+    }
+
+    fn secureInstallApplication(self: *AmDevice, url: Url, opts: DictRef) !void {
+        switch (AMDeviceSecureInstallApplication(0, self, url, opts, installCallback, 0)) {
+            0 => {},
+            else => |e| {
+                log.err("secure install application failed with error: {d}", .{e});
+                return error.SecureInstallApplicationFailed;
+            },
+        }
+    }
+
+    fn validatePairing(self: *AmDevice) !void {
+        switch (AMDeviceValidatePairing(self)) {
+            0 => {},
+            else => |e| {
+                log.err("failed to validate pairing with the device with error: {d}", .{e});
+                return error.ValidatePairingFailed;
+            },
+        }
+    }
+
+    fn startSession(self: *AmDevice) !void {
+        switch (AMDeviceStartSession(self)) {
+            0 => {},
+            else => |e| {
+                log.err("failed to start session with the device with error: {d}", .{e});
+                return error.StartSessionFailed;
+            },
+        }
+    }
+
+    fn stopSession(self: *AmDevice) !void {
+        switch (AMDeviceStopSession(self)) {
+            0 => {},
+            else => |e| {
+                log.err("failed to stop session with the device with error: {d}", .{e});
+                return error.StopSessionFailed;
+            },
+        }
+    }
+
+    fn installBundle(self: *AmDevice, allocator: Allocator, bundle_id: []const u8, bundle_path: []const u8) !void {
         log.debug("will install bundle...", .{});
+
         const path = stringFromBytes(bundle_path);
         defer path.deinit();
         const rel_url = CFURLCreateWithFileSystemPath(null, path, .posix, false);
         defer rel_url.deinit();
         const url = CFURLCopyAbsoluteURL(rel_url);
         defer url.deinit();
-        log.debug("url = {}", .{url});
-        _ = bundle_id;
-        _ = self;
+
+        const keys = &[_]String{stringFromBytes("PackageType")};
+        const values = &[_]String{stringFromBytes("Developer")};
+        const opts = CFDictionaryCreate(
+            null,
+            @ptrCast([*]*const anyopaque, keys),
+            @ptrCast([*]*const anyopaque, values),
+            1,
+            &kCFTypeDictionaryKeyCallBacks,
+            &kCFTypeDictionaryValueCallBacks,
+        );
+        defer opts.deinit();
+
+        try self.secureTransferPath(url, opts);
+
+        try self.connect();
+        defer self.disconnect() catch {};
+
+        assert(self.isPaired());
+        try self.validatePairing();
+
+        try self.startSession();
+        defer self.stopSession() catch {};
+
+        try self.secureInstallApplication(url, opts);
+
+        const bid = stringFromBytes(bundle_id);
+        defer bid.deinit();
+
+        const app_url = try self.copyDeviceAppUrl(bid);
+        if (app_url) |u| {
+            const raw_str = CFURLCopyFileSystemPath(u, .posix);
+            const installed_path = try raw_str.cstr(allocator);
+            defer allocator.free(installed_path);
+            log.warn("installed_path = {s}", .{installed_path});
+        }
+    }
+
+    fn copyDeviceAppUrl(self: *AmDevice, bundle_id: String) !?Url {
+        var out: DictRef = undefined;
+        defer out.deinit();
+
+        const value_obj = CFArrayCreate(null, @ptrCast([*]*const anyopaque, &[_]String{
+            stringFromBytes("CFBundleIdentifier"),
+            stringFromBytes("Path"),
+        }), 2, &kCFTypeArrayCallBacks);
+        defer value_obj.deinit();
+
+        const values = &[_]ArrayRef{value_obj};
+        const keys = &[_]String{stringFromBytes("ReturnAttributes")};
+        const opts = CFDictionaryCreate(
+            null,
+            @ptrCast([*]*const anyopaque, keys),
+            @ptrCast([*]*const anyopaque, values),
+            1,
+            &kCFTypeDictionaryKeyCallBacks,
+            &kCFTypeDictionaryValueCallBacks,
+        );
+        defer opts.deinit();
+
+        switch (AMDeviceLookupApplications(self, opts, &out)) {
+            0 => {},
+            else => |e| {
+                log.err("failed to lookup applications on device with error: {d}", .{e});
+                return error.LookupApplicationsFailed;
+            },
+        }
+
+        const raw_app_info = out.getValue(bundle_id) orelse return null;
+        const app_dict = @ptrCast(DictRef, raw_app_info);
+        const raw_path = app_dict.getValue(stringFromBytes("Path")).?;
+        const path = @ptrCast(String, raw_path);
+        const url = CFURLCreateWithFileSystemPath(null, path, .posix, true);
+        return url;
     }
 
     extern "c" fn AMDeviceRelease(device: *AmDevice) void;
     extern "c" fn AMDeviceConnect(device: *AmDevice) c_int;
     extern "c" fn AMDeviceDisconnect(device: *AmDevice) c_int;
+    extern "c" fn AMDeviceIsPaired(device: *AmDevice) c_int;
+    extern "c" fn AMDeviceValidatePairing(device: *AmDevice) c_int;
+    extern "c" fn AMDeviceStartSession(device: *AmDevice) c_int;
+    extern "c" fn AMDeviceStopSession(device: *AmDevice) c_int;
     extern "c" fn AMDeviceCopyValue(device: *AmDevice, ?*anyopaque, key: String) String;
     extern "c" fn AMDeviceGetInterfaceType(device: *AmDevice) c_int;
+    extern "c" fn AMDeviceSecureTransferPath(
+        c_int,
+        device: *AmDevice,
+        url: Url,
+        opts: DictRef,
+        cb: GenericCallback,
+        cbarg: c_int,
+    ) c_int;
+    extern "c" fn AMDeviceSecureInstallApplication(c_int, device: *AmDevice, url: Url, opts: DictRef, cb: GenericCallback, cbarg: c_int) c_int;
+    extern "c" fn AMDeviceLookupApplications(device: *AmDevice, opts: DictRef, out: *DictRef) c_int;
 
     extern "c" fn CFURLCreateWithFileSystemPath(?*anyopaque, path: String, path_style: PathStyle, is_dir: bool) Url;
     extern "c" fn CFURLCopyAbsoluteURL(Url) Url;
+    extern "c" fn CFURLCopyFileSystemPath(Url, PathStyle) String;
 };
+
+const GenericCallback = fn (DictRef, c_int) callconv(.C) c_int;
+
+fn transferCallback(dict: DictRef, arg: c_int) callconv(.C) c_int {
+    _ = arg;
+    const gpa = state.gpa.allocator();
+
+    if (dict.getValue(stringFromBytes("Error"))) |_| {
+        log.err("error while transferring...", .{});
+        return 0;
+    }
+
+    if (dict.getValue(stringFromBytes("Status"))) |cf_status| {
+        const status = @ptrCast(String, cf_status).cstr(gpa) catch unreachable;
+        defer gpa.free(status);
+
+        log.debug("transfer status: {s}", .{status});
+    }
+
+    return 0;
+}
+
+fn installCallback(dict: DictRef, arg: c_int) callconv(.C) c_int {
+    _ = arg;
+    const gpa = state.gpa.allocator();
+
+    if (dict.getValue(stringFromBytes("Error"))) |_| {
+        log.err("error while installing...", .{});
+        return 0;
+    }
+
+    if (dict.getValue(stringFromBytes("Status"))) |cf_status| {
+        const status = @ptrCast(String, cf_status).cstr(gpa) catch unreachable;
+        defer gpa.free(status);
+
+        log.debug("install status: {s}", .{status});
+    }
+
+    return 0;
+}
 
 pub const Url = *opaque {
     fn deinit(self: Url) void {
@@ -160,7 +342,7 @@ fn deviceCallback(info: *AmDeviceNotificationCallbackInfo, arg: ?*anyopaque) cal
 
             log.debug("connected to {s}!", .{ident.name});
             log.debug("installing {s} @ {s}", .{ BUNDLE_ID, state.bundle_path });
-            state.device.?.installBundle(BUNDLE_ID, state.bundle_path.?) catch unreachable;
+            state.device.?.installBundle(gpa, BUNDLE_ID, state.bundle_path.?) catch unreachable;
         },
         ADNCI_MSG_DISCONNECTED => {
             log.debug("disconnected", .{});
@@ -273,7 +455,13 @@ const DictRef = *opaque {
     fn deinit(self: DictRef) void {
         CFRelease(self);
     }
+
+    fn getValue(self: DictRef, key: *anyopaque) ?*anyopaque {
+        return CFDictionaryGetValue(self, key);
+    }
 };
+
+extern "c" fn CFDictionaryGetValue(d: DictRef, key: *anyopaque) ?*anyopaque;
 
 const Boolean = *opaque {};
 
@@ -284,3 +472,20 @@ pub fn runLoop() void {
 }
 
 extern "c" fn CFRunLoopRun() void;
+
+const ArrayRef = *opaque {
+    fn deinit(self: ArrayRef) void {
+        CFRelease(self);
+    }
+};
+
+const ArrayCallBacks = opaque {};
+
+extern "c" var kCFTypeArrayCallBacks: ArrayCallBacks;
+
+extern "c" fn CFArrayCreate(
+    allocator: ?*anyopaque,
+    values: [*]*const anyopaque,
+    len: usize,
+    cbs: *const ArrayCallBacks,
+) ArrayRef;
