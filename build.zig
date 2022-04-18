@@ -27,6 +27,7 @@ pub fn build(b: *std.build.Builder) void {
     exe.setTarget(target);
     exe.setBuildMode(mode);
     exe.addPackagePath("clap", "clap/clap.zig");
+    exe.addPackagePath("ZigKit", "ZigKit/src/main.zig");
     exe.linkFramework("CoreFoundation");
     exe.linkFramework("MobileDevice");
     exe.addFrameworkPath(normal_framework_search_dir);
@@ -42,11 +43,4 @@ pub fn build(b: *std.build.Builder) void {
 
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
-
-    const exe_tests = b.addTest("src/main.zig");
-    exe_tests.setTarget(target);
-    exe_tests.setBuildMode(mode);
-
-    const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&exe_tests.step);
 }
